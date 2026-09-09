@@ -22,6 +22,7 @@ from x402.extensions.sign_in_with_x import (
     SIWxValidationCode,
     SIWxValidationOptions,
     SIWxVerifyOptions,
+    assert_siwx_challenge_bound_to_origin,
     create_siwx_client_hook,
     create_siwx_payload,
     create_siwx_request_hook,
@@ -38,6 +39,7 @@ from x402.extensions.sign_in_with_x import (
     parse_siwx_header,
     validate_siwx_message,
     verify_siwx_signature,
+    verify_solana_signature,
 )
 from x402.http.types import HTTPRequestContext, PaymentOption, RouteConfig
 from x402.schemas import (
@@ -58,6 +60,11 @@ pytest.importorskip("nacl")
 
 API_ORIGIN = "https://api.example.com"
 EXAMPLE_ORIGIN = "http://example.com"
+
+
+def _bound_request_url(info: dict) -> str:
+    """Return a 402 response URL bound to the challenge's declared uri origin."""
+    return info["uri"]
 
 
 def _valid_payload(**overrides) -> SIWxPayload:
@@ -328,7 +335,7 @@ class TestEvmIntegration:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "eip191",
         }
-        payload = await create_siwx_payload(complete, account)
+        payload = await create_siwx_payload(complete, account, _bound_request_url(complete))
         parsed = parse_siwx_header(encode_siwx_header(payload))
         assert (await validate_siwx_message(parsed, API_ORIGIN)).is_valid
         verification = await verify_siwx_signature(parsed)
@@ -389,10 +396,31 @@ class TestSolana:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "ed25519",
         }
-        payload = await create_siwx_payload(complete, _Signer())
+        payload = await create_siwx_payload(complete, _Signer(), _bound_request_url(complete))
         result = await verify_siwx_signature(payload)
         assert result.is_valid
         assert result.payer == address
+
+    def test_rejects_small_order_public_key_forgery(self):
+        public_key = b"\x01" + bytes(31)
+        signature = b"\x01" + bytes(63)
+
+        assert verify_solana_signature("arbitrary message", signature, public_key) is False
+
+    @pytest.mark.asyncio
+    async def test_siwx_rejects_small_order_public_key_forgery(self):
+        public_key = b"\x01" + bytes(31)
+        signature = b"\x01" + bytes(63)
+        payload = _valid_payload(
+            chainId=SOLANA_MAINNET,
+            type="ed25519",
+            address=encode_base58(public_key),
+            signature=encode_base58(signature),
+        )
+
+        result = await verify_siwx_signature(payload)
+        assert result.is_valid is False
+        assert result.invalid_reason == "invalid_siwx_signature"
 
     @pytest.mark.asyncio
     async def test_keypair_signer_sign_verify(self):
@@ -416,7 +444,7 @@ class TestSolana:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "ed25519",
         }
-        payload = await create_siwx_payload(complete, signer)
+        payload = await create_siwx_payload(complete, signer, _bound_request_url(complete))
         result = await verify_siwx_signature(payload)
         assert result.is_valid
         assert result.payer == signer.address
@@ -466,7 +494,7 @@ class TestVerifyStructuredErrors:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "eip191",
         }
-        payload = await create_siwx_payload(complete, account)
+        payload = await create_siwx_payload(complete, account, _bound_request_url(complete))
 
         async def _verifier(**_kwargs) -> bool:
             return False
@@ -490,7 +518,7 @@ class TestVerifyStructuredErrors:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "eip191",
         }
-        payload = await create_siwx_payload(complete, account)
+        payload = await create_siwx_payload(complete, account, _bound_request_url(complete))
 
         async def _verifier(**_kwargs) -> bool:
             raise RuntimeError("RPC error")
@@ -566,7 +594,9 @@ class TestRequestHook:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "eip191",
         }
-        header = encode_siwx_header(await create_siwx_payload(complete, account))
+        header = encode_siwx_header(
+            await create_siwx_payload(complete, account, _bound_request_url(complete))
+        )
         hook = create_siwx_request_hook(
             CreateSIWxRequestHookOptions(storage=storage, origin=EXAMPLE_ORIGIN)
         )
@@ -604,7 +634,9 @@ class TestRequestHookOriginBinding:
             "chainId": ext["supportedChains"][0]["chainId"],
             "type": "eip191",
         }
-        header = encode_siwx_header(await create_siwx_payload(complete, account))
+        header = encode_siwx_header(
+            await create_siwx_payload(complete, account, _bound_request_url(complete))
+        )
         hook = create_siwx_request_hook(
             CreateSIWxRequestHookOptions(storage=storage, origin=API_ORIGIN)
         )
@@ -671,7 +703,8 @@ class TestClientHook:
                     )
                 ],
                 extensions=challenge,
-            )
+            ),
+            request_url="http://example.com/resource",
         )
         result = await hook(ctx)
         assert isinstance(result, PaymentRequiredHeadersResult)
@@ -696,11 +729,133 @@ class TestClientHook:
                 x402_version=2,
                 accepts=[],
                 extensions=challenge,
-            )
+            ),
+            request_url="http://example.com/profile",
         )
         result = await hook(ctx)
         assert isinstance(result, PaymentRequiredHeadersResult)
         assert SIGN_IN_WITH_X in result.headers
+
+
+class TestOriginBinding:
+    @pytest.mark.asyncio
+    async def test_throws_when_challenge_domain_does_not_match_response_origin(self):
+        account = Account.create()
+        challenge = _test_challenge(
+            domain="evil.example.com",
+            resource_uri="https://api.example.com/resource",
+            network="eip155:8453",
+        )
+        ext = challenge[SIGN_IN_WITH_X]
+        complete = {
+            **ext["info"],
+            "chainId": ext["supportedChains"][0]["chainId"],
+            "type": ext["supportedChains"][0]["type"],
+        }
+
+        with pytest.raises(ValueError, match="domain.*does not match"):
+            await create_siwx_payload(complete, account, "https://api.example.com/resource")
+
+    @pytest.mark.asyncio
+    async def test_throws_when_challenge_uri_origin_does_not_match_response_origin(self):
+        account = Account.create()
+        challenge = _test_challenge(
+            domain="api.example.com",
+            resource_uri="https://evil.example.com/resource",
+            network="eip155:8453",
+        )
+        ext = challenge[SIGN_IN_WITH_X]
+        complete = {
+            **ext["info"],
+            "chainId": ext["supportedChains"][0]["chainId"],
+            "type": ext["supportedChains"][0]["type"],
+        }
+
+        with pytest.raises(ValueError, match="uri origin.*does not match"):
+            await create_siwx_payload(complete, account, "https://api.example.com/resource")
+
+    @pytest.mark.asyncio
+    async def test_signs_when_challenge_is_bound_to_response_origin(self):
+        account = Account.create()
+        challenge = _test_challenge(
+            domain="api.example.com",
+            resource_uri="https://api.example.com/resource",
+            network="eip155:8453",
+        )
+        ext = challenge[SIGN_IN_WITH_X]
+        complete = {
+            **ext["info"],
+            "chainId": ext["supportedChains"][0]["chainId"],
+            "type": ext["supportedChains"][0]["type"],
+        }
+
+        payload = await create_siwx_payload(complete, account, "https://api.example.com/resource")
+        assert payload.signature
+
+    @pytest.mark.asyncio
+    async def test_allows_cross_origin_resources_when_domain_and_uri_match(self):
+        account = Account.create()
+        challenge = _test_challenge(
+            domain="api.example.com",
+            resource_uri="https://api.example.com/resource",
+            network="eip155:8453",
+        )
+        ext = challenge[SIGN_IN_WITH_X]
+        complete = {
+            **ext["info"],
+            "resources": ["https://cdn.other-example.com/asset"],
+            "chainId": ext["supportedChains"][0]["chainId"],
+            "type": ext["supportedChains"][0]["type"],
+        }
+
+        payload = await create_siwx_payload(complete, account, "https://api.example.com/resource")
+        assert payload.signature
+        assert payload.resources == ["https://cdn.other-example.com/asset"]
+
+    def test_assert_siwx_challenge_bound_to_origin_throws_on_invalid_uri(self):
+        with pytest.raises(ValueError, match="uri.*not a valid URL"):
+            assert_siwx_challenge_bound_to_origin(
+                {
+                    "domain": "api.example.com",
+                    "uri": "not-a-url",
+                    "version": "1",
+                    "nonce": "abc",
+                    "issuedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+                "https://api.example.com/resource",
+            )
+
+    @pytest.mark.asyncio
+    async def test_client_hook_does_not_sign_when_origin_is_mismatched(self):
+        account = Account.create()
+        hook = create_siwx_client_hook(account)
+        challenge = _test_challenge(
+            domain="evil.example.com",
+            resource_uri="https://evil.example.com/resource",
+            network="eip155:1",
+        )
+
+        result = await hook(
+            PaymentRequiredContext(
+                payment_required=PaymentRequired(
+                    x402_version=2,
+                    accepts=[
+                        PaymentRequirements(
+                            scheme="exact",
+                            network="eip155:1",
+                            asset="0xusdc",
+                            amount="1000",
+                            pay_to="0xpay",
+                            max_timeout_seconds=300,
+                        )
+                    ],
+                    extensions=challenge,
+                ),
+                request_url="http://example.com/resource",
+            )
+        )
+
+        assert result is None
 
 
 class TestServerExtension:

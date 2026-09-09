@@ -8,9 +8,11 @@ import {
   FacilitatorClient,
   FacilitatorResponseError,
   getFacilitatorResponseError,
+  attachBackgroundInitHandler,
   SETTLEMENT_OVERRIDES_HEADER,
   SettlementOverrides,
   checkIfBazaarNeeded,
+  withPrivateCacheControl,
 } from "@x402/core/server";
 import { SchemeNetworkServer, Network } from "@x402/core/types";
 import { NextFunction, Request, Response } from "express";
@@ -53,6 +55,17 @@ function sendFacilitatorError(res: Response, error: FacilitatorResponseError): v
 }
 
 /**
+ * Logs an unexpected error and sends a generic 500 without leaking internals.
+ *
+ * @param res - The Express response to write to
+ * @param error - The unexpected error
+ */
+function sendInternalError(res: Response, error: unknown): void {
+  console.error(error);
+  res.status(500).json({ error: "Internal Server Error" });
+}
+
+/**
  * Express payment middleware for x402 protocol (direct HTTP server instance).
  *
  * Use this when you need to configure HTTP-level hooks.
@@ -90,6 +103,11 @@ export function paymentMiddlewareFromHTTPServer(
   // Store initialization promise (not the result)
   // httpServer.initialize() fetches facilitator support and validates routes
   let initPromise: Promise<void> | null = syncFacilitatorOnStart ? httpServer.initialize() : null;
+  // Retryable failures (e.g. a facilitator timeout) must not become unhandled
+  // rejections; the original promise is still awaited on the first protected
+  // request. Fatal capability / route mismatches exit the process so a
+  // misconfigured server does not stay up until that request.
+  attachBackgroundInitHandler(initPromise);
   let isInitialized = false;
 
   /**
@@ -157,7 +175,8 @@ export function paymentMiddlewareFromHTTPServer(
           sendFacilitatorError(res, facilitatorError);
           return;
         }
-        return next(error);
+        sendInternalError(res, error);
+        return;
       }
     }
 
@@ -176,7 +195,8 @@ export function paymentMiddlewareFromHTTPServer(
         sendFacilitatorError(res, error);
         return;
       }
-      return next(error);
+      sendInternalError(res, error);
+      return;
     }
 
     // Handle the different result types
@@ -201,8 +221,13 @@ export function paymentMiddlewareFromHTTPServer(
 
       case "payment-verified":
         // Payment is valid, need to wrap response for settlement
-        const { cancellationDispatcher, paymentPayload, paymentRequirements, declaredExtensions } =
-          result;
+        const {
+          cancellationDispatcher,
+          beforeHandlerSettlement,
+          paymentPayload,
+          paymentRequirements,
+          declaredExtensions,
+        } = result;
 
         // Intercept and buffer all core methods that can commit response to client
         const originalWriteHead = res.writeHead.bind(res);
@@ -270,10 +295,23 @@ export function paymentMiddlewareFromHTTPServer(
         try {
           await Promise.resolve(next());
         } catch (error) {
-          await cancellationDispatcher.cancel({
+          const cancelSettlement = await cancellationDispatcher.cancel({
             reason: "handler_threw",
             error,
           });
+          const existingCacheControl =
+            res.getHeader("Cache-Control") != null ? String(res.getHeader("Cache-Control")) : null;
+          const failureHeaders = httpServer.createFailurePathSettlementHeaders(
+            cancelSettlement,
+            beforeHandlerSettlement,
+            paymentPayload,
+            existingCacheControl,
+          );
+          if (failureHeaders) {
+            Object.entries(failureHeaders).forEach(([key, value]) => {
+              res.setHeader(key, String(value));
+            });
+          }
           bufferedCalls = [];
           restoreResponseMethods();
           return next(error);
@@ -284,11 +322,24 @@ export function paymentMiddlewareFromHTTPServer(
 
         // If the response from the protected route is >= 400, do not settle payment
         if (res.statusCode >= 400) {
-          await cancellationDispatcher.cancel({
+          const cancelSettlement = await cancellationDispatcher.cancel({
             reason: "handler_failed",
             responseStatus: res.statusCode,
           });
           res.removeHeader(SETTLEMENT_OVERRIDES_HEADER);
+          const existingCacheControl =
+            res.getHeader("Cache-Control") != null ? String(res.getHeader("Cache-Control")) : null;
+          const failureHeaders = httpServer.createFailurePathSettlementHeaders(
+            cancelSettlement,
+            beforeHandlerSettlement,
+            paymentPayload,
+            existingCacheControl,
+          );
+          if (failureHeaders) {
+            Object.entries(failureHeaders).forEach(([key, value]) => {
+              res.setHeader(key, String(value));
+            });
+          }
           restoreResponseMethods();
           // Replay all buffered calls in order
           for (const [method, args] of bufferedCalls) {
@@ -323,6 +374,8 @@ export function paymentMiddlewareFromHTTPServer(
             paymentRequirements,
             declaredExtensions,
             { request: context, responseBody, responseHeaders },
+            undefined,
+            beforeHandlerSettlement,
           );
 
           // If settlement fails, return an error and do not send the buffered response
@@ -344,6 +397,14 @@ export function paymentMiddlewareFromHTTPServer(
           Object.entries(settleResult.headers).forEach(([key, value]) => {
             res.setHeader(key, value);
           });
+          res.setHeader(
+            "Cache-Control",
+            withPrivateCacheControl(
+              res.getHeader("Cache-Control") != null
+                ? String(res.getHeader("Cache-Control"))
+                : null,
+            ),
+          );
         } catch (error) {
           if (error instanceof FacilitatorResponseError) {
             bufferedCalls = [];
